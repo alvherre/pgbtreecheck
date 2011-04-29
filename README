@@ -5,3 +5,5 @@ It then recreates the tree and runs some simple checks to verify consistency
 of the tree metadata.
 
 Any problem found is reported as a WARNING.
+
+You can find pg_filedump at http://pgfoundry.org/projects/pgfiledump
