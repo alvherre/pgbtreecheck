@@ -1,0 +1,432 @@
+#!/usr/bin/perl -w
+
+use warnings;
+use strict;
+
+# an array of Block objects, indexed by block number
+my @blocks;
+
+# array of blocks believed to have a broken level label.  This gets set
+# by check_level_of_children.
+my @borkedlevels;
+
+# block number of the fast root.  Note: we ignore the true root
+my $fastroot;
+
+# Level of the fast root page
+my $rootlevel;
+
+# parsing vars
+my $currblock;
+my $inmeta;
+my $indata;
+my $inspecial;
+my $in_item;
+while (<>) {
+	if (/^Block\s+(\d+) /) {
+		dispose_previous_block($currblock) if defined $currblock;
+		$currblock = Block->new($1);
+		# metapage is block number 0
+		$inmeta = ($1 == 0);
+	}
+
+	if ($inmeta and /FastRoot: Block \((\d+)\)\s+Level \((\d+)\)/) {
+		$fastroot = $1;
+		$rootlevel = $2;
+	}
+
+	if (/^<Data>/) {
+		$indata = 1;
+		next;
+	}
+	if (/^<Special Section>/) {
+		$indata = 0;
+		$inspecial = 1;
+		next;
+	}
+	if (/^<Header>/) {
+		$indata = 0;
+		$inspecial = 0;
+		next;
+	}
+
+	if ($indata) {
+		if (/^ Item\s+(\d+) /) {
+			$in_item = $1;
+		}
+		if (/^  Block Id: (\d+)/) {
+			$currblock->addchild($in_item, $1);
+		}
+	}
+
+	if ($inspecial) {
+		if (/^  Blocks: Previous \((\d+)\)\s+Next \((\d+)\)(.*)/) {
+			$currblock->siblings($1, $2);
+			my $rest = $3;
+			if ($rest =~ /\s+Level \((\d+)\)/) {
+				$currblock->level($1);
+			}
+			if ($rest =~ /\s+Next XID \((\d+)\)/) {
+				$currblock->nextxid($1);
+			}
+		}
+
+		# read flags
+		$currblock->deleted(1) if /^  Flags:.*DELETED/;
+		$currblock->isleaf(1) if /^  Flags.*LEAF/;
+	}
+}
+dispose_previous_block($currblock);
+print "NOTICE: fast root: block $fastroot at level $rootlevel\n";
+
+set_parents();
+
+check_level_of_children($fastroot, $rootlevel);
+for my $level (0 .. $rootlevel) {
+	my $blk = get_leftmost_block($level);
+	check_siblings_walking_right($blk, $level);
+	check_visited_walking_right($blk, $level);
+}
+check_visited_walking_down($fastroot);
+
+for my $blk (@borkedlevels) {
+	print "block $blk is claimed as child by ";
+	for my $pblk (@blocks) {
+		next if $pblk->isleaf;
+		my $children = $pblk->children;
+		for my $lp (keys %$children) {
+			print $pblk->blocknum, " " if $children->{$lp} == $blk;
+		}
+	}
+	print "\n";
+}
+
+exit;
+
+# Call this when we finish parsing a block
+sub dispose_previous_block {
+	my $block = shift;
+
+	$blocks[$block->blocknum] = $block;
+}
+
+# return the block number of the leftmost page of the given level
+sub get_leftmost_block {
+	my $level = shift;
+	my $blk = $fastroot;
+
+	if ($level > $rootlevel) {
+		die "cannot find leftmost page for level $level; there are only $rootlevel levels";
+	}
+
+	# maybe this coding can get into trouble if these down pointers are
+	# corrupt ... we assume it will crash at some point.
+	while (1) {
+		if ($blocks[$blk]->level == $level)
+		{
+			return $blk;
+		}
+
+		# On a non-rightmost page (right sibling != 0), the first
+		# itemptr stores the high key.  Use the second child in that
+		# case.
+		my $offset = $blocks[$blk]->rightptr != 0 ? 2 : 1;
+		$blk = $blocks[$blk]->children->{$offset};
+	}
+}
+
+# Given a block number, walk right checking the left/right pointers of the
+# current page and the right sibling.
+sub check_siblings_walking_right {
+	my $blk = shift;
+	my $level = shift;
+
+	print "NOTICE: Checking forward scan of level $level, starting at block $blk\n";
+
+	while (1) {
+		# if this block is not leftmost, check its left sibling;
+		# its right pointer should point to the current block
+		if ($blocks[$blk]->leftptr != 0)
+		{
+			my $leftsibl = $blocks[$blk]->leftptr;
+			if ($blocks[$leftsibl]->rightptr != $blk) {
+				print "WARNING: left sibling $leftsibl does not point right to me ($blk); points to ", $blocks[$leftsibl]->rightptr, " instead\n";
+			}
+		}
+
+		# done when in a rightmost block
+		last if $blocks[$blk]->rightptr == 0;
+
+		my $rightsibl = $blocks[$blk]->rightptr;
+
+		# check that this block's right sibling points left
+		# to the current block
+		if ($blocks[$rightsibl]->leftptr != $blk) {
+			print "WARNING: right sibling $rightsibl does not point left to me ($blk); points to ", $blocks[$rightsibl]->leftptr, " instead\n";
+		}
+
+
+		# and walk right
+		$blk = $blocks[$blk]->rightptr;
+	}
+
+	print "NOTICE: done checking level $level\n";
+}
+
+# starting at the rightmost block for a level, walk left marking them "visited";
+# at the end of the walk, examine all the blocks we know about and figure out
+# whether they were visited.  Only blocks labeled with the same level should have
+# been visited; warn if blocks with a different level were visited, and also warn
+# if blocks in that level were not visited.
+sub check_visited_walking_right {
+	my $blk = shift;
+	my $level = shift;
+
+	# reset the "visited" bit on all blocks to initialize
+	for my $blk (@blocks) {
+		$blk->visited(0);
+	}
+
+	print "NOTICE: checking visited nodes on level $level, starting at block $blk\n";
+
+	while (1) {
+		# sanity check
+		if ($blocks[$blk]->level != $level) {
+			print "WARNING: block ", $blk->blocknum, " is on level ",
+			$blocks[$blk]->level, ", bailing out :-(\n";
+			last;
+		}
+		$blocks[$blk]->visited(1);
+		last if $blocks[$blk]->rightptr == 0;
+		$blk = $blocks[$blk]->rightptr;
+	}
+
+	for my $blk (@blocks) {
+		# ignore metapage
+		next if $blk->blocknum == 0;
+		# ignore deleted pages (may have no level)
+		next if $blk->deleted;
+
+		if ($blk->level == $level and not $blk->visited) {
+			print "WARNING: block ", $blk->blocknum, " wasn't visited\n";
+		}
+		if ($blk->level != $level and $blk->visited) {
+			print "WARNING: block ", $blk->blocknum, " was visited, but shouldn't have been\n";
+		}
+	}
+
+	print "NOTICE: done checking visited nodes on level $level\n";
+}
+
+# starting at the specified root block, walk down marking all blocks
+# "visited".  When the walk is done, examine all the blocks we know about and
+# warn if they weren't visited.
+sub check_visited_walking_down {
+	my $root = shift;
+
+	for my $blk (@blocks) {
+		$blk->visited(0);
+	}
+
+	print "started checking at root $root\n";
+
+	_toggle_visited_down_rec($root);
+
+	for my $blk (@blocks) {
+		# ignore metapage
+		next if $blk->blocknum == 0;
+
+		# blocks not deleted should have been visited
+		if (not $blk->deleted and not $blk->visited) {
+			print "WARNING: block ", $blk->blocknum, " wasn't visited in a top-down scan\n";
+		}
+
+		# A deleted block that was visited is harmless ...
+		# XXX really?
+		if ($blk->deleted and $blk->visited) {
+			print "ATTENTION: deleted block ", $blk->blocknum, " was visited\n";
+			use Data::Dumper;
+			print Dumper $blk;
+		}
+	}
+}
+
+# recursive walker for check_visited_walking_down: given a block, mark
+# it visited and then its children recursively.
+sub _toggle_visited_down_rec {
+	my $blk = shift;
+
+	if ($blocks[$blk]->visited) {
+		print "WARNING: block $blk already visited\n";
+	}
+	$blocks[$blk]->visited(1);
+	if (not $blocks[$blk]->isleaf) {
+		my $children = $blocks[$blk]->children;
+		for my $child (keys %$children) {
+			# Note: on a non-rightmost page, the first item is the
+			# high key, and thus the pointer does not go down to a
+			# valid child page.  Ignore it.
+			next if $blocks[$blk]->rightptr != 0 && $child == 1;
+
+			_toggle_visited_down_rec($children->{$child});
+		}
+	}
+}
+
+# Set the parent block on each page. The blocks themselves don't know who is
+# the parent, so we need to walk down the tree for this.
+sub set_parents {
+	print "NOTICE: setting page parents\n";
+	_set_parent_rec($fastroot, $rootlevel);
+	print "NOTICE: done setting parents\n";
+}
+
+# recursive worker for set_parents
+sub _set_parent_rec {
+	my $blk = shift;
+	my $parent = shift;
+
+	my $oldparent = $blocks[$blk]->parent($parent);
+	if (defined $oldparent) {
+		print "WARNING: block $blk already had a parent ($oldparent); new parent is $parent\n";
+	}
+	if (not $blocks[$blk]->isleaf) {
+		my $children = $blocks[$blk]->children;
+		for my $child (keys %$children) {
+			# Note: on a non-rightmost page, the first item is the
+			# high key, and thus the pointer does not go down to a
+			# valid child page.  Ignore it.
+			next if $blocks[$blk]->rightptr != 0 && $child == 1;
+
+			_set_parent_rec($children->{$child}, $blk);
+		}
+	}
+}
+
+# check the level labels of the children of the given block. They should be
+# one less than the passed level (which is that of the given block).
+# Blocks that fail this check are added to the @borkedlevels array
+sub check_level_of_children {
+	my $blknum = shift;
+	my $level = shift;
+
+	return if $blocks[$blknum]->isleaf;
+	die if $blocks[$blknum]->deleted;
+
+	my $children = $blocks[$blknum]->children;
+	foreach my $chldlnnum (keys %$children) {
+		my $chldblk = $children->{$chldlnnum};
+		if (not defined $blocks[$chldblk]) {
+			print "WARNING: $blknum has inexistant child $chldblk (item $chldlnnum)\n";
+			next;
+		}
+		next if $blocks[$chldblk]->deleted;
+		my $chldlvl = $blocks[$chldblk]->level;
+		if ($chldlvl != $level - 1) {
+			print "WARNING: child $chldblk of $blknum has level $chldlvl, should be ".($level-1)."\n";
+			push @borkedlevels, $chldblk;
+		} else {
+			# Note: we don't recursively check levels of children
+			# of blocks that themselves have wrong levels.  We
+			# assume they are all going to be broken anyway.
+			check_level_of_children($chldblk, $level - 1);
+		}
+	}
+}
+
+# to be written ...
+sub check_sideptrs_of_children {
+}
+
+package Block;
+sub new {
+	my $class = shift;
+	my $blocknum = shift;
+	my $self = { blocknum => $blocknum };
+	return bless $self, $class;
+}
+
+# Set the left and right sibling pointers
+sub siblings {
+	my $self = shift;
+	$self->{left} = $1;
+	$self->{right} = $2;
+}
+
+sub leftptr {
+	my $self = shift;
+	return $self->{left};
+}
+
+sub rightptr {
+	my $self = shift;
+	return $self->{right};
+}
+
+# stock get/setters
+# I think there's a better idiom for these but I cannot remember it
+sub level {
+	my $self = shift;
+	my $level = shift;
+	$self->{level} = $level if defined $level;
+	return $self->{level};
+}
+
+sub blocknum {
+	my $self = shift;
+	my $num = shift;
+	$self->{blocknum} = $num if defined $num;
+	return $self->{blocknum};
+}
+
+sub deleted {
+	my $self = shift;
+	my $deleted = shift;
+	$self->{deleted} = $deleted if defined $deleted;
+	return $self->{deleted};
+}
+
+sub isleaf {
+	my $self = shift;
+	my $isleaf = shift;
+	$self->{isleaf} = $isleaf if defined $isleaf;
+	return $self->{isleaf};
+}
+
+sub visited {
+	my $self = shift;
+	my $visited = shift;
+	$self->{visited} = $visited if defined $visited;
+	return $self->{visited};
+}
+
+sub nextxid {
+	my $self = shift;
+	my $nextxid = shift;
+	$self->{nextxid} = $nextxid if defined $nextxid;
+	return $self->{nextxid};
+}
+
+# note API inconsistency with the rest of setters
+sub parent {
+	my $self = shift;
+	my $parent = shift;
+	my $oldparent = $self->{parent};
+	$self->{parent} = $parent if defined $parent;
+	return $oldparent;
+}
+
+# add the block number as child to the specified item
+sub addchild {
+	my $self = shift;
+	my $itemnr = shift;
+	my $blockid = shift;
+
+	$self->{children}->{$itemnr} = $blockid;
+}
+
+# Return the hashref of children block nums, or an empty hashref if none
+sub children {
+	my $self = shift;
+	return $self->{children} || {};
+}

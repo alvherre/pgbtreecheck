@@ -1,0 +1,7 @@
+pgbtreecheck runs some simple checks on Postgres b-tree indexes.
+
+It's written in Perl and receives the output from pg_filedump.
+It then recreates the tree and runs some simple checks to verify consistency
+of the tree metadata.
+
+Any problem found is reported as a WARNING.
